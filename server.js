@@ -92,39 +92,60 @@ app.use(helmet({
 }));
 
 // CORS (credentials ile)
-app.use(cors({
-  origin: function(origin, cb){
-    // Postman/curl için origin yoksa izin ver
+const allowList = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+const corsOptions = {
+  origin: function (origin, cb) {
+    // Postman/curl gibi originsiz istekleri izinli say
     if (!origin) return cb(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    return cb(new Error('Not allowed by CORS: ' + origin));
+    if (allowList.includes(origin)) return cb(null, true);
+    return cb(new Error('CORS: origin not allowed -> ' + origin));
   },
-  credentials: true
-}));
+  credentials: true,
+  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  optionsSuccessStatus: 204
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions)); // preflight
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan('dev'));
 
 // Kalıcı session (Mongo store)
+app.set('trust proxy', 1);
+
 app.use(session({
   name: 'sid',
   secret: SESSION_SECRET,
   store: MongoStore.create({
     mongoUrl: MONGODB_URI,
-    ttl: 60 * 60 * 24 * 7, // 7 gün
+    ttl: 60 * 60 * 24 * 7,
     crypto: { secret: SESSION_SECRET }
   }),
   resave: false,
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
-    secure: true,                       // HTTPS şart
-    sameSite: COOKIE_SAMESITE,          // 'none' (farklı domain) / 'lax' (aynı site)
-    maxAge: 1000 * 60 * 60 * 8,         // 8 saat
-    domain: COOKIE_DOMAIN               // opsiyonel
+    secure: true,                      // HTTPS zorunlu
+    sameSite: (process.env.COOKIE_SAMESITE || 'none').toLowerCase(), // 'none'
+    maxAge: 1000 * 60 * 60 * 8
+    // domain: YOK (ayarlama) — varsayılan olarak api hostunda kalsın
   }
 }));
+
+app.use((err, req, res, next) => {
+  if (err && typeof err.message === 'string' && err.message.startsWith('CORS:')) {
+    console.error(err.message);
+    return res.status(403).json({ error: err.message });
+  }
+  next(err);
+});
 
 // ---------- Auth (çok basit) ----------
 const loginLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 20 });
