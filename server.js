@@ -1,6 +1,8 @@
+// server.js
 const path = require('path');
 const express = require('express');
 const session = require('express-session');
+const MongoStore = require('connect-mongo');
 const rateLimit = require('express-rate-limit');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -17,10 +19,16 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const SESSION_SECRET = process.env.SESSION_SECRET || 'devsecret';
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'password';
+
 const BUNNY_STORAGE_NAME = process.env.BUNNY_STORAGE_NAME;
 const BUNNY_STORAGE_KEY = process.env.BUNNY_STORAGE_KEY;
 const BUNNY_STORAGE_HOST = process.env.BUNNY_STORAGE_HOST || 'https://storage.bunnycdn.com';
 const BUNNY_CDN_BASE = process.env.BUNNY_CDN_BASE; // e.g. https://cdn.uskudarsahne.com
+
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean);
+// Farklı domainler => third-party cookie mecburen SameSite=None + Secure
+const COOKIE_SAMESITE = (process.env.COOKIE_SAMESITE || 'none').toLowerCase(); // 'none' | 'lax' | 'strict'
+const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN || undefined; // opsiyonel, örn: ".uskudarsahne.com"
 
 if (!MONGODB_URI) throw new Error('MONGODB_URI missing');
 if (!BUNNY_STORAGE_NAME || !BUNNY_STORAGE_KEY || !BUNNY_CDN_BASE) {
@@ -38,28 +46,36 @@ mongoose.connect(MONGODB_URI).then(() => {
 
 const { Schema, Types } = mongoose;
 
+// Schemas
+const ImageSetSchema = new Schema({
+  w640: String,
+  w1024: String
+}, { _id: false });
+
 const CategorySchema = new Schema({
   name: { type: String, required: true, trim: true },
-  kind: { type: String, enum: ['food','drink'], required: true }, // yemek/icecek
-  images: { w640: String, w1024: String }
-}, { timestamps: { createdAt: 'createdAt', updatedAt: 'updatedAt' } });
+  kind: { type: String, enum: ['food','drink'], required: true }, // "yemek mi içecek mi"
+  images: { type: ImageSetSchema, default: {} }
+}, { timestamps: true });
+
 CategorySchema.index({ name: 1 }, { unique: true, collation: { locale: 'tr', strength: 2 } });
 
 const ProductSchema = new Schema({
   name: { type: String, required: true, trim: true },
   description: { type: String, default: '' },
   price: { type: Schema.Types.Decimal128, required: true },
-  images: { w640: String, w1024: String },
+  images: { type: ImageSetSchema, default: {} },
   categoryId: { type: Schema.Types.ObjectId, ref: 'Category', required: true }
-}, { timestamps: { createdAt: 'createdAt', updatedAt: 'updatedAt' } });
-ProductSchema.index({ categoryId: 1, name: 1 });
-ProductSchema.index({ name: 'text', description: 'text' }, { default_language: 'turkish' });
+}, { timestamps: true });
+
+ProductSchema.index({ categoryId: 1, name: 1 }); // idx_products_category_name
+ProductSchema.index({ name: 'text', description: 'text' }, { default_language: 'turkish' }); // idx_products_text_tr
 
 const EventSchema = new Schema({
   name: { type: String, required: true, trim: true },
   description: { type: String, default: '' },
-  images: { w640: String, w1024: String }
-}, { timestamps: { createdAt: 'createdAt', updatedAt: 'updatedAt' } });
+  images: { type: ImageSetSchema, default: {} }
+}, { timestamps: true });
 
 const Category = mongoose.model('Category', CategorySchema, 'categories');
 const Product  = mongoose.model('Product',  ProductSchema,  'products');
@@ -68,27 +84,49 @@ const Event    = mongoose.model('Event',    EventSchema,    'events');
 // ---------- APP ----------
 const app = express();
 
-app.use(helmet());
-app.use(cors({ origin: true, credentials: true }));
+app.set('trust proxy', 1);
+
+// Güvenlik başlıkları
+app.use(helmet({
+  crossOriginResourcePolicy: false, // CDN görselleri için
+}));
+
+// CORS (credentials ile)
+app.use(cors({
+  origin: function(origin, cb){
+    // Postman/curl için origin yoksa izin ver
+    if (!origin) return cb(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error('Not allowed by CORS: ' + origin));
+  },
+  credentials: true
+}));
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan('dev'));
-app.set('trust proxy', 1);
 
+// Kalıcı session (Mongo store)
 app.use(session({
   name: 'sid',
   secret: SESSION_SECRET,
+  store: MongoStore.create({
+    mongoUrl: MONGODB_URI,
+    ttl: 60 * 60 * 24 * 7, // 7 gün
+    crypto: { secret: SESSION_SECRET }
+  }),
   resave: false,
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
-    secure: false, // prod'da true + HTTPS
-    sameSite: 'lax',
-    maxAge: 1000 * 60 * 60 * 8 // 8 saat
+    secure: true,                       // HTTPS şart
+    sameSite: COOKIE_SAMESITE,          // 'none' (farklı domain) / 'lax' (aynı site)
+    maxAge: 1000 * 60 * 60 * 8,         // 8 saat
+    domain: COOKIE_DOMAIN               // opsiyonel
   }
 }));
 
-// ---------- Auth ----------
+// ---------- Auth (çok basit) ----------
 const loginLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 20 });
 
 app.post('/api/auth/login', loginLimiter, async (req, res) => {
@@ -102,7 +140,12 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
 
 app.post('/api/auth/logout', (req, res) => {
   req.session.destroy(() => {
-    res.clearCookie('sid');
+    res.clearCookie('sid', {
+      httpOnly: true,
+      secure: true,
+      sameSite: COOKIE_SAMESITE,
+      domain: COOKIE_DOMAIN
+    });
     res.json({ ok: true });
   });
 });
@@ -112,8 +155,6 @@ app.get('/api/auth/me', (req, res) => {
 });
 
 function requireAuth(req, res, next) {
-  console.log(['req',req]);
-  console.log(['res',res]);
   if (!req.session.user) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
@@ -129,7 +170,10 @@ async function bunnyPut(pathInZone, buffer, contentType) {
   const url = `${BUNNY_STORAGE_HOST}/${BUNNY_STORAGE_NAME}/${pathInZone}`;
   const res = await fetch(url, {
     method: 'PUT',
-    headers: { 'AccessKey': BUNNY_STORAGE_KEY, 'Content-Type': contentType },
+    headers: {
+      'AccessKey': BUNNY_STORAGE_KEY,
+      'Content-Type': contentType
+    },
     body: buffer
   });
   if (!res.ok) {
@@ -157,7 +201,7 @@ async function processAndUpload(fileBuffer, basePath, baseNameNoExt, vTag) {
 // ---------- Public API ----------
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
-app.get('/api/categories', async (_req, res) => {
+app.get('/api/categories', async (req, res) => {
   const categories = await Category.find().sort({ createdAt: 1 }).lean();
   res.json(categories);
 });
@@ -179,41 +223,17 @@ app.get('/api/products/:id', async (req, res) => {
   res.json(prod);
 });
 
-app.get('/api/events', async (_req, res) => {
-  const events = await Event.find().sort({ createdAt: -1 }).lean();
-  res.json(events);
+app.get('/api/events', async (req, res) => {
+  const items = await Event.find().sort({ createdAt: -1 }).lean();
+  res.json(items);
 });
 
 app.get('/api/events/:id', async (req, res) => {
   const { id } = req.params;
   if (!Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'bad id' });
-  const ev = await Event.findById(id).lean();
-  if (!ev) return res.status(404).json({ error: 'not found' });
-  res.json(ev);
-});
-
-// ---------- Admin LIST (lazy fetch) ----------
-app.get('/api/admin/categories', requireAuth, async (_req, res) => {
-  const docs = await Category.find().sort({ createdAt: -1 }).lean();
-  res.json(docs);
-});
-
-app.get('/api/admin/products', requireAuth, async (_req, res) => {
-  const docs = await Product.find()
-    .populate({ path: 'categoryId', select: 'name' })
-    .sort({ createdAt: -1 })
-    .lean();
-  const mapped = docs.map(d => ({
-    ...d,
-    categoryName: d.categoryId?.name || null,
-    categoryId: d.categoryId?._id || d.categoryId
-  }));
-  res.json(mapped);
-});
-
-app.get('/api/admin/events', requireAuth, async (_req, res) => {
-  const docs = await Event.find().sort({ createdAt: -1 }).lean();
-  res.json(docs);
+  const doc = await Event.findById(id).lean();
+  if (!doc) return res.status(404).json({ error: 'not found' });
+  res.json(doc);
 });
 
 // ---------- Admin: Categories CRUD ----------
@@ -246,8 +266,8 @@ app.put('/api/admin/categories/:id', requireAuth, async (req, res) => {
 app.delete('/api/admin/categories/:id', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const linked = await Product.countDocuments({ categoryId: id });
-    if (linked > 0) return res.status(400).json({ error: `Kategoriye bağlı ${linked} ürün var` });
+    const count = await Product.countDocuments({ categoryId: id });
+    if (count > 0) return res.status(409).json({ error: 'Category has related products' });
     const doc = await Category.findByIdAndDelete(id);
     if (!doc) return res.status(404).json({ error: 'not found' });
     res.json({ ok: true });
@@ -343,7 +363,7 @@ app.delete('/api/admin/events/:id', requireAuth, async (req, res) => {
   }
 });
 
-// ---------- Upload to Bunny (category/product/event) ----------
+// ---------- Admin: Upload to Bunny (category/product/event) ----------
 app.post('/api/admin/upload/:type/:id', requireAuth, upload.single('file'), async (req, res) => {
   try {
     const { type, id } = req.params;
@@ -358,9 +378,9 @@ app.post('/api/admin/upload/:type/:id', requireAuth, upload.single('file'), asyn
     const urls = await processAndUpload(req.file.buffer, basePath, baseName, v);
 
     let doc;
-    if (type === 'categories') doc = await Category.findByIdAndUpdate(id, { images: urls }, { new: true });
-    else if (type === 'products') doc = await Product.findByIdAndUpdate(id, { images: urls }, { new: true });
-    else doc = await Event.findByIdAndUpdate(id, { images: urls }, { new: true });
+    if (type === 'categories')      doc = await Category.findByIdAndUpdate(id, { images: urls }, { new: true });
+    else if (type === 'products')   doc = await Product.findByIdAndUpdate(id, { images: urls }, { new: true });
+    else if (type === 'events')     doc = await Event.findByIdAndUpdate(id, { images: urls }, { new: true });
 
     if (!doc) return res.status(404).json({ error: 'doc not found' });
 
