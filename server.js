@@ -36,38 +36,34 @@ mongoose.connect(MONGODB_URI).then(() => {
   process.exit(1);
 });
 
-// Schemas
 const { Schema, Types } = mongoose;
 
 const CategorySchema = new Schema({
   name: { type: String, required: true, trim: true },
-  kind: { type: String, enum: ['food','drink'], required: true }, // "yemek mi içecek mi"
-  images: {
-    w640: { type: String },
-    w1024: { type: String }
-  }
+  kind: { type: String, enum: ['food','drink'], required: true }, // yemek/icecek
+  images: { w640: String, w1024: String }
 }, { timestamps: { createdAt: 'createdAt', updatedAt: 'updatedAt' } });
-
-// Unique by name (case-insensitive): Atlas'ta oluşturduğun index ile uyumlu.
 CategorySchema.index({ name: 1 }, { unique: true, collation: { locale: 'tr', strength: 2 } });
 
 const ProductSchema = new Schema({
   name: { type: String, required: true, trim: true },
   description: { type: String, default: '' },
   price: { type: Schema.Types.Decimal128, required: true },
-  images: {
-    w640: { type: String },
-    w1024: { type: String }
-  },
+  images: { w640: String, w1024: String },
   categoryId: { type: Schema.Types.ObjectId, ref: 'Category', required: true }
 }, { timestamps: { createdAt: 'createdAt', updatedAt: 'updatedAt' } });
+ProductSchema.index({ categoryId: 1, name: 1 });
+ProductSchema.index({ name: 'text', description: 'text' }, { default_language: 'turkish' });
 
-// Örnek indexler (Atlas'ta zaten oluşturduysan tekrarlamaz):
-ProductSchema.index({ categoryId: 1, name: 1 }); // idx_products_category_name
-ProductSchema.index({ name: 'text', description: 'text' }, { default_language: 'turkish' }); // idx_products_text_tr
+const EventSchema = new Schema({
+  name: { type: String, required: true, trim: true },
+  description: { type: String, default: '' },
+  images: { w640: String, w1024: String }
+}, { timestamps: { createdAt: 'createdAt', updatedAt: 'updatedAt' } });
 
 const Category = mongoose.model('Category', CategorySchema, 'categories');
 const Product  = mongoose.model('Product',  ProductSchema,  'products');
+const Event    = mongoose.model('Event',    EventSchema,    'events');
 
 // ---------- APP ----------
 const app = express();
@@ -86,13 +82,13 @@ app.use(session({
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
-    secure: false, // prod: true (HTTPS)
+    secure: false, // prod'da true + HTTPS
     sameSite: 'lax',
-    maxAge: 1000 * 60 * 60 * 8 // 8h
+    maxAge: 1000 * 60 * 60 * 8 // 8 saat
   }
 }));
 
-// ---------- Auth (çok basit, tokensiz) ----------
+// ---------- Auth ----------
 const loginLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 20 });
 
 app.post('/api/auth/login', loginLimiter, async (req, res) => {
@@ -116,6 +112,8 @@ app.get('/api/auth/me', (req, res) => {
 });
 
 function requireAuth(req, res, next) {
+  console.log(['req',req]);
+  console.log(['res',res]);
   if (!req.session.user) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
@@ -131,10 +129,7 @@ async function bunnyPut(pathInZone, buffer, contentType) {
   const url = `${BUNNY_STORAGE_HOST}/${BUNNY_STORAGE_NAME}/${pathInZone}`;
   const res = await fetch(url, {
     method: 'PUT',
-    headers: {
-      'AccessKey': BUNNY_STORAGE_KEY,
-      'Content-Type': contentType
-    },
+    headers: { 'AccessKey': BUNNY_STORAGE_KEY, 'Content-Type': contentType },
     body: buffer
   });
   if (!res.ok) {
@@ -147,7 +142,6 @@ async function bunnyPut(pathInZone, buffer, contentType) {
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } });
 
 async function processAndUpload(fileBuffer, basePath, baseNameNoExt, vTag) {
-  // 2 boyut (webp). İstersen AVIF de ekleyebilirsin.
   const w640  = await sharp(fileBuffer).resize({ width: 640 }).webp({ quality: 82 }).toBuffer();
   const w1024 = await sharp(fileBuffer).resize({ width: 1024 }).webp({ quality: 80 }).toBuffer();
 
@@ -163,7 +157,7 @@ async function processAndUpload(fileBuffer, basePath, baseNameNoExt, vTag) {
 // ---------- Public API ----------
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
-app.get('/api/categories', async (req, res) => {
+app.get('/api/categories', async (_req, res) => {
   const categories = await Category.find().sort({ createdAt: 1 }).lean();
   res.json(categories);
 });
@@ -183,6 +177,43 @@ app.get('/api/products/:id', async (req, res) => {
   const prod = await Product.findById(id).lean();
   if (!prod) return res.status(404).json({ error: 'not found' });
   res.json(prod);
+});
+
+app.get('/api/events', async (_req, res) => {
+  const events = await Event.find().sort({ createdAt: -1 }).lean();
+  res.json(events);
+});
+
+app.get('/api/events/:id', async (req, res) => {
+  const { id } = req.params;
+  if (!Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'bad id' });
+  const ev = await Event.findById(id).lean();
+  if (!ev) return res.status(404).json({ error: 'not found' });
+  res.json(ev);
+});
+
+// ---------- Admin LIST (lazy fetch) ----------
+app.get('/api/admin/categories', requireAuth, async (_req, res) => {
+  const docs = await Category.find().sort({ createdAt: -1 }).lean();
+  res.json(docs);
+});
+
+app.get('/api/admin/products', requireAuth, async (_req, res) => {
+  const docs = await Product.find()
+    .populate({ path: 'categoryId', select: 'name' })
+    .sort({ createdAt: -1 })
+    .lean();
+  const mapped = docs.map(d => ({
+    ...d,
+    categoryName: d.categoryId?.name || null,
+    categoryId: d.categoryId?._id || d.categoryId
+  }));
+  res.json(mapped);
+});
+
+app.get('/api/admin/events', requireAuth, async (_req, res) => {
+  const docs = await Event.find().sort({ createdAt: -1 }).lean();
+  res.json(docs);
 });
 
 // ---------- Admin: Categories CRUD ----------
@@ -215,9 +246,10 @@ app.put('/api/admin/categories/:id', requireAuth, async (req, res) => {
 app.delete('/api/admin/categories/:id', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
+    const linked = await Product.countDocuments({ categoryId: id });
+    if (linked > 0) return res.status(400).json({ error: `Kategoriye bağlı ${linked} ürün var` });
     const doc = await Category.findByIdAndDelete(id);
     if (!doc) return res.status(404).json({ error: 'not found' });
-    // Not: İsteğe bağlı olarak bu kategoriye bağlı ürünleri de silmek isteyebilirsin.
     res.json({ ok: true });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -273,33 +305,63 @@ app.delete('/api/admin/products/:id', requireAuth, async (req, res) => {
   }
 });
 
-// ---------- Admin: Upload to Bunny (category/product) ----------
-// Route: POST /api/admin/upload/:type/:id
-// type: categories | products
-// body: multipart/form-data { file }
-// action: üretilen URL'leri döner ve dokümana yazar (images.w640, images.w1024)
+// ---------- Admin: Events CRUD ----------
+app.post('/api/admin/events', requireAuth, async (req, res) => {
+  try {
+    const { name, description } = req.body;
+    const doc = await Event.create({ name, description: description || '' });
+    res.status(201).json(doc);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.put('/api/admin/events/:id', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, description, images } = req.body;
+    const update = {};
+    if (name != null) update.name = name;
+    if (description != null) update.description = description;
+    if (images && typeof images === 'object') update.images = images;
+    const doc = await Event.findByIdAndUpdate(id, update, { new: true });
+    if (!doc) return res.status(404).json({ error: 'not found' });
+    res.json(doc);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete('/api/admin/events/:id', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const doc = await Event.findByIdAndDelete(id);
+    if (!doc) return res.status(404).json({ error: 'not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ---------- Upload to Bunny (category/product/event) ----------
 app.post('/api/admin/upload/:type/:id', requireAuth, upload.single('file'), async (req, res) => {
   try {
     const { type, id } = req.params;
     if (!req.file) return res.status(400).json({ error: 'file missing' });
-    if (!['categories','products'].includes(type)) return res.status(400).json({ error: 'bad type' });
+    if (!['categories','products','events'].includes(type)) return res.status(400).json({ error: 'bad type' });
     if (!Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'bad id' });
 
-    // version tag: timestamp
     const v = `v${Date.now()}`;
-
-    const basePath = `${type}/${id}`; // categories/<id> | products/<id>
+    const basePath = `${type}/${id}`;
     const baseName = type === 'categories' ? 'cover' : 'main';
 
     const urls = await processAndUpload(req.file.buffer, basePath, baseName, v);
 
-    // DB'ye yaz
     let doc;
-    if (type === 'categories') {
-      doc = await Category.findByIdAndUpdate(id, { images: urls }, { new: true });
-    } else {
-      doc = await Product.findByIdAndUpdate(id, { images: urls }, { new: true });
-    }
+    if (type === 'categories') doc = await Category.findByIdAndUpdate(id, { images: urls }, { new: true });
+    else if (type === 'products') doc = await Product.findByIdAndUpdate(id, { images: urls }, { new: true });
+    else doc = await Event.findByIdAndUpdate(id, { images: urls }, { new: true });
+
     if (!doc) return res.status(404).json({ error: 'doc not found' });
 
     res.json({ ok: true, images: urls, doc });
