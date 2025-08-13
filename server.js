@@ -1,4 +1,3 @@
-// server.js
 const path = require('path');
 const express = require('express');
 const session = require('express-session');
@@ -25,11 +24,6 @@ const BUNNY_STORAGE_KEY = process.env.BUNNY_STORAGE_KEY;
 const BUNNY_STORAGE_HOST = process.env.BUNNY_STORAGE_HOST || 'https://storage.bunnycdn.com';
 const BUNNY_CDN_BASE = process.env.BUNNY_CDN_BASE; // e.g. https://cdn.uskudarsahne.com
 
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean);
-// Farklı domainler => third-party cookie mecburen SameSite=None + Secure
-const COOKIE_SAMESITE = (process.env.COOKIE_SAMESITE || 'none').toLowerCase(); // 'none' | 'lax' | 'strict'
-const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN || undefined; // opsiyonel, örn: ".uskudarsahne.com"
-
 if (!MONGODB_URI) throw new Error('MONGODB_URI missing');
 if (!BUNNY_STORAGE_NAME || !BUNNY_STORAGE_KEY || !BUNNY_CDN_BASE) {
   console.warn('[WARN] Bunny CDN env vars missing; upload routes will fail until set.');
@@ -46,36 +40,42 @@ mongoose.connect(MONGODB_URI).then(() => {
 
 const { Schema, Types } = mongoose;
 
-// Schemas
-const ImageSetSchema = new Schema({
-  w640: String,
-  w1024: String
-}, { _id: false });
-
+// Categories
 const CategorySchema = new Schema({
   name: { type: String, required: true, trim: true },
   kind: { type: String, enum: ['food','drink'], required: true }, // "yemek mi içecek mi"
-  images: { type: ImageSetSchema, default: {} }
-}, { timestamps: true });
+  images: {
+    w640: String,
+    w1024: String
+  }
+}, { timestamps: { createdAt: 'createdAt', updatedAt: 'updatedAt' } });
 
 CategorySchema.index({ name: 1 }, { unique: true, collation: { locale: 'tr', strength: 2 } });
 
+// Products
 const ProductSchema = new Schema({
   name: { type: String, required: true, trim: true },
   description: { type: String, default: '' },
   price: { type: Schema.Types.Decimal128, required: true },
-  images: { type: ImageSetSchema, default: {} },
+  images: {
+    w640: String,
+    w1024: String
+  },
   categoryId: { type: Schema.Types.ObjectId, ref: 'Category', required: true }
-}, { timestamps: true });
+}, { timestamps: { createdAt: 'createdAt', updatedAt: 'updatedAt' } });
 
 ProductSchema.index({ categoryId: 1, name: 1 }); // idx_products_category_name
 ProductSchema.index({ name: 'text', description: 'text' }, { default_language: 'turkish' }); // idx_products_text_tr
 
+// Events (basit)
 const EventSchema = new Schema({
   name: { type: String, required: true, trim: true },
   description: { type: String, default: '' },
-  images: { type: ImageSetSchema, default: {} }
-}, { timestamps: true });
+  images: {
+    w640: String,
+    w1024: String
+  }
+}, { timestamps: { createdAt: 'createdAt', updatedAt: 'updatedAt' } });
 
 const Category = mongoose.model('Category', CategorySchema, 'categories');
 const Product  = mongoose.model('Product',  ProductSchema,  'products');
@@ -84,14 +84,14 @@ const Event    = mongoose.model('Event',    EventSchema,    'events');
 // ---------- APP ----------
 const app = express();
 
-app.set('trust proxy', 1);
-
-// Güvenlik başlıkları
 app.use(helmet({
-  crossOriginResourcePolicy: false, // CDN görselleri için
+  crossOriginResourcePolicy: { policy: "cross-origin" } // img vs.
 }));
+app.use(morgan('dev'));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
 
-// CORS (credentials ile)
+// --- CORS (credentials + preflight) ---
 const allowList = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
@@ -99,8 +99,7 @@ const allowList = (process.env.ALLOWED_ORIGINS || '')
 
 const corsOptions = {
   origin: function (origin, cb) {
-    // Postman/curl gibi originsiz istekleri izinli say
-    if (!origin) return cb(null, true);
+    if (!origin) return cb(null, true); // Postman/curl
     if (allowList.includes(origin)) return cb(null, true);
     return cb(new Error('CORS: origin not allowed -> ' + origin));
   },
@@ -109,17 +108,12 @@ const corsOptions = {
   allowedHeaders: ['Content-Type', 'Authorization'],
   optionsSuccessStatus: 204
 };
-
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions)); // preflight
+app.options('*', cors(corsOptions));
 
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
-app.use(morgan('dev'));
-
-// Kalıcı session (Mongo store)
 app.set('trust proxy', 1);
 
+// Sessions (cookie cross-site uyumlu)
 app.use(session({
   name: 'sid',
   secret: SESSION_SECRET,
@@ -132,25 +126,26 @@ app.use(session({
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
-    secure: true,                      // HTTPS zorunlu
+    secure: true,                                      // HTTPS şart
     sameSite: (process.env.COOKIE_SAMESITE || 'none').toLowerCase(), // 'none'
-    maxAge: 1000 * 60 * 60 * 8
-    // domain: YOK (ayarlama) — varsayılan olarak api hostunda kalsın
+    maxAge: 1000 * 60 * 60 * 8                          // 8h
+    // domain: AYARLAMA! (varsayılan api hostunda kalsın)
   }
 }));
 
+// CORS error'larını 403 yap
 app.use((err, req, res, next) => {
-  if (err && typeof err.message === 'string' && err.message.startsWith('CORS:')) {
+  if (err && String(err.message || '').startsWith('CORS:')) {
     console.error(err.message);
     return res.status(403).json({ error: err.message });
   }
-  next(err);
+  next();
 });
 
-// ---------- Auth (çok basit) ----------
+// ---------- Auth (basit) ----------
 const loginLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 20 });
 
-app.post('/api/auth/login', loginLimiter, async (req, res) => {
+app.post('/api/auth/login', loginLimiter, (req, res) => {
   const { username, password } = req.body || {};
   if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
     req.session.user = { username };
@@ -161,12 +156,7 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
 
 app.post('/api/auth/logout', (req, res) => {
   req.session.destroy(() => {
-    res.clearCookie('sid', {
-      httpOnly: true,
-      secure: true,
-      sameSite: COOKIE_SAMESITE,
-      domain: COOKIE_DOMAIN
-    });
+    res.clearCookie('sid');
     res.json({ ok: true });
   });
 });
@@ -249,12 +239,28 @@ app.get('/api/events', async (req, res) => {
   res.json(items);
 });
 
-app.get('/api/events/:id', async (req, res) => {
-  const { id } = req.params;
-  if (!Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'bad id' });
-  const doc = await Event.findById(id).lean();
-  if (!doc) return res.status(404).json({ error: 'not found' });
-  res.json(doc);
+// ---------- Admin LIST endpoints (eksikti) ----------
+app.get('/api/admin/categories', requireAuth, async (req, res) => {
+  const { q } = req.query;
+  const filter = q ? { name: { $regex: String(q), $options: 'i' } } : {};
+  const items = await Category.find(filter).sort({ createdAt: -1 }).lean();
+  res.json(items);
+});
+
+app.get('/api/admin/products', requireAuth, async (req, res) => {
+  const { q, categoryId } = req.query;
+  const filter = {};
+  if (q) filter.$text = { $search: String(q) };
+  if (categoryId && Types.ObjectId.isValid(categoryId)) filter.categoryId = new Types.ObjectId(categoryId);
+  const items = await Product.find(filter).sort({ createdAt: -1 }).lean();
+  res.json(items);
+});
+
+app.get('/api/admin/events', requireAuth, async (req, res) => {
+  const { q } = req.query;
+  const filter = q ? { name: { $regex: String(q), $options: 'i' } } : {};
+  const items = await Event.find(filter).sort({ createdAt: -1 }).lean();
+  res.json(items);
 });
 
 // ---------- Admin: Categories CRUD ----------
@@ -263,9 +269,7 @@ app.post('/api/admin/categories', requireAuth, async (req, res) => {
     const { name, kind } = req.body;
     const doc = await Category.create({ name, kind });
     res.status(201).json(doc);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 app.put('/api/admin/categories/:id', requireAuth, async (req, res) => {
@@ -279,22 +283,20 @@ app.put('/api/admin/categories/:id', requireAuth, async (req, res) => {
     const doc = await Category.findByIdAndUpdate(id, update, { new: true });
     if (!doc) return res.status(404).json({ error: 'not found' });
     res.json(doc);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 app.delete('/api/admin/categories/:id', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const count = await Product.countDocuments({ categoryId: id });
-    if (count > 0) return res.status(409).json({ error: 'Category has related products' });
+    const prodCount = await Product.countDocuments({ categoryId: id });
+    if (prodCount > 0) {
+      return res.status(400).json({ error: `Kategoriye bağlı ${prodCount} ürün var. Önce ürünleri taşı/sil.` });
+    }
     const doc = await Category.findByIdAndDelete(id);
     if (!doc) return res.status(404).json({ error: 'not found' });
     res.json({ ok: true });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // ---------- Admin: Products CRUD ----------
@@ -309,9 +311,7 @@ app.post('/api/admin/products', requireAuth, async (req, res) => {
       categoryId
     });
     res.status(201).json(doc);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
@@ -330,9 +330,7 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
     const doc = await Product.findByIdAndUpdate(id, update, { new: true });
     if (!doc) return res.status(404).json({ error: 'not found' });
     res.json(doc);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 app.delete('/api/admin/products/:id', requireAuth, async (req, res) => {
@@ -341,9 +339,7 @@ app.delete('/api/admin/products/:id', requireAuth, async (req, res) => {
     const doc = await Product.findByIdAndDelete(id);
     if (!doc) return res.status(404).json({ error: 'not found' });
     res.json({ ok: true });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // ---------- Admin: Events CRUD ----------
@@ -352,9 +348,7 @@ app.post('/api/admin/events', requireAuth, async (req, res) => {
     const { name, description } = req.body;
     const doc = await Event.create({ name, description: description || '' });
     res.status(201).json(doc);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 app.put('/api/admin/events/:id', requireAuth, async (req, res) => {
@@ -368,9 +362,7 @@ app.put('/api/admin/events/:id', requireAuth, async (req, res) => {
     const doc = await Event.findByIdAndUpdate(id, update, { new: true });
     if (!doc) return res.status(404).json({ error: 'not found' });
     res.json(doc);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 app.delete('/api/admin/events/:id', requireAuth, async (req, res) => {
@@ -379,12 +371,10 @@ app.delete('/api/admin/events/:id', requireAuth, async (req, res) => {
     const doc = await Event.findByIdAndDelete(id);
     if (!doc) return res.status(404).json({ error: 'not found' });
     res.json({ ok: true });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-// ---------- Admin: Upload to Bunny (category/product/event) ----------
+// ---------- Admin: Upload (category/product/event) ----------
 app.post('/api/admin/upload/:type/:id', requireAuth, upload.single('file'), async (req, res) => {
   try {
     const { type, id } = req.params;
@@ -399,12 +389,11 @@ app.post('/api/admin/upload/:type/:id', requireAuth, upload.single('file'), asyn
     const urls = await processAndUpload(req.file.buffer, basePath, baseName, v);
 
     let doc;
-    if (type === 'categories')      doc = await Category.findByIdAndUpdate(id, { images: urls }, { new: true });
-    else if (type === 'products')   doc = await Product.findByIdAndUpdate(id, { images: urls }, { new: true });
-    else if (type === 'events')     doc = await Event.findByIdAndUpdate(id, { images: urls }, { new: true });
+    if (type === 'categories') doc = await Category.findByIdAndUpdate(id, { images: urls }, { new: true });
+    else if (type === 'products') doc = await Product.findByIdAndUpdate(id, { images: urls }, { new: true });
+    else doc = await Event.findByIdAndUpdate(id, { images: urls }, { new: true });
 
     if (!doc) return res.status(404).json({ error: 'doc not found' });
-
     res.json({ ok: true, images: urls, doc });
   } catch (err) {
     console.error(err);
