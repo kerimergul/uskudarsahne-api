@@ -256,7 +256,7 @@ app.get('/api/events/upcoming', async (req, res) => {
     console.error('upcoming error:', err);
     res.status(500).json({ error: err.message });
   }
-});g
+});
 
 // ---------- Admin LIST endpoints ----------
 app.get('/api/admin/categories', requireAuth, async (req, res) => {
