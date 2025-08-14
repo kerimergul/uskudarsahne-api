@@ -71,11 +71,10 @@ ProductSchema.index({ name: 'text', description: 'text' }, { default_language: '
 const EventSchema = new Schema({
   name: { type: String, required: true, trim: true },
   description: { type: String, default: '' },
-  images: {
-    w640: String,
-    w1024: String
-  }
+  eventDate: { type: Date, required: true }, // <<< YENİ
+  images: { w640: String, w1024: String }
 }, { timestamps: { createdAt: 'createdAt', updatedAt: 'updatedAt' } });
+EventSchema.index({ eventDate: 1 });   
 
 const Category = mongoose.model('Category', CategorySchema, 'categories');
 const Product  = mongoose.model('Product',  ProductSchema,  'products');
@@ -239,7 +238,7 @@ app.get('/api/events', async (req, res) => {
   res.json(items);
 });
 
-// ---------- Admin LIST endpoints (eksikti) ----------
+// ---------- Admin LIST endpoints ----------
 app.get('/api/admin/categories', requireAuth, async (req, res) => {
   const { q } = req.query;
   const filter = q ? { name: { $regex: String(q), $options: 'i' } } : {};
@@ -256,10 +255,17 @@ app.get('/api/admin/products', requireAuth, async (req, res) => {
   res.json(items);
 });
 
-app.get('/api/admin/events', requireAuth, async (req, res) => {
-  const { q } = req.query;
-  const filter = q ? { name: { $regex: String(q), $options: 'i' } } : {};
-  const items = await Event.find(filter).sort({ createdAt: -1 }).lean();
+app.get('/api/admin/events', requireAuth, async (req,res)=>{
+  // opsiyonel tarih filtresi: ?from=ISO&to=ISO
+  const { q, from, to } = req.query;
+  const filter = {};
+  if (q) filter.name = { $regex: String(q), $options: 'i' };
+  if (from || to) {
+    filter.eventDate = {};
+    if (from) filter.eventDate.$gte = new Date(from);
+    if (to)   filter.eventDate.$lte = new Date(to);
+  }
+  const items = await Event.find(filter).sort({ eventDate: -1 }).lean(); // yeni>eski
   res.json(items);
 });
 
@@ -342,36 +348,41 @@ app.delete('/api/admin/products/:id', requireAuth, async (req, res) => {
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-// ---------- Admin: Events CRUD ----------
-app.post('/api/admin/events', requireAuth, async (req, res) => {
-  try {
-    const { name, description } = req.body;
-    const doc = await Event.create({ name, description: description || '' });
+// ---- EVENTS CRUD ----
+app.post('/api/admin/events', requireAuth, async (req,res)=>{
+  try{
+    const { name, description, eventDate } = req.body;
+    const dt = new Date(eventDate);
+    if (!name || !eventDate || isNaN(dt.getTime())) return res.status(400).json({ error:'name/eventDate required' });
+    const doc = await Event.create({ name, description: description||'', eventDate: dt });
     res.status(201).json(doc);
-  } catch (err) { res.status(400).json({ error: err.message }); }
+  }catch(err){ res.status(400).json({ error: err.message }); }
 });
-
-app.put('/api/admin/events/:id', requireAuth, async (req, res) => {
-  try {
+app.put('/api/admin/events/:id', requireAuth, async (req,res)=>{
+  try{
     const { id } = req.params;
-    const { name, description, images } = req.body;
+    const { name, description, images, eventDate } = req.body;
     const update = {};
     if (name != null) update.name = name;
     if (description != null) update.description = description;
     if (images && typeof images === 'object') update.images = images;
-    const doc = await Event.findByIdAndUpdate(id, update, { new: true });
-    if (!doc) return res.status(404).json({ error: 'not found' });
+    if (eventDate != null) {
+      const dt = new Date(eventDate);
+      if (isNaN(dt.getTime())) return res.status(400).json({ error:'bad eventDate' });
+      update.eventDate = dt;
+    }
+    const doc = await Event.findByIdAndUpdate(id, update, { new:true });
+    if (!doc) return res.status(404).json({ error:'not found' });
     res.json(doc);
-  } catch (err) { res.status(400).json({ error: err.message }); }
+  }catch(err){ res.status(400).json({ error: err.message }); }
 });
-
-app.delete('/api/admin/events/:id', requireAuth, async (req, res) => {
-  try {
+app.delete('/api/admin/events/:id', requireAuth, async (req,res)=>{
+  try{
     const { id } = req.params;
     const doc = await Event.findByIdAndDelete(id);
-    if (!doc) return res.status(404).json({ error: 'not found' });
-    res.json({ ok: true });
-  } catch (err) { res.status(400).json({ error: err.message }); }
+    if (!doc) return res.status(404).json({ error:'not found' });
+    res.json({ ok:true });
+  }catch(err){ res.status(400).json({ error: err.message }); }
 });
 
 // ---------- Admin: Upload (category/product/event) ----------
