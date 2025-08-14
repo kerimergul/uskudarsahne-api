@@ -237,6 +237,26 @@ app.get('/api/events', async (req, res) => {
   const items = await Event.find().sort({ createdAt: -1 }).lean();
   res.json(items);
 });
+app.get('/api/events/upcoming', async (req, res) => {
+  try {
+    const { from, limit = 12 } = req.query;
+    const start = from ? new Date(from) : new Date();
+    if (from && isNaN(start.getTime())) {
+      return res.status(400).json({ error: 'bad from' });
+    }
+    const lim = Math.min(parseInt(limit, 10) || 12, 50);
+
+    const items = await Event.find({ eventDate: { $gte: start } })
+      .sort({ eventDate: 1 }) // en yakın tarih önce
+      .limit(lim)
+      .lean();
+
+    res.json(items);
+  } catch (err) {
+    console.error('upcoming error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ---------- Admin LIST endpoints ----------
 app.get('/api/admin/categories', requireAuth, async (req, res) => {
@@ -384,6 +404,7 @@ app.delete('/api/admin/events/:id', requireAuth, async (req,res)=>{
     res.json({ ok:true });
   }catch(err){ res.status(400).json({ error: err.message }); }
 });
+
 
 // ---------- Admin: Upload (category/product/event) ----------
 app.post('/api/admin/upload/:type/:id', requireAuth, upload.single('file'), async (req, res) => {
