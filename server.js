@@ -357,7 +357,7 @@ app.post('/api/admin/events', requireAuth, async (req, res) => {
   try {
     const last = await Event.findOne().sort({ order: -1 }).select('order').lean();
     const nextOrder = last && typeof last.order === 'number' ? last.order + 1 : 1;
-const { name, description, eventDate }} = req.body;
+    const { name, description, eventDate } = req.body;
     const doc = await Event.create({ order: nextOrder,  name, description: description || '' });
     res.status(201).json(doc);
   } catch (err) { res.status(400).json({ error: err.message }); }
