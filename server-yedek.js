@@ -47,8 +47,7 @@ const CategorySchema = new Schema({
   images: {
     w640: String,
     w1024: String
-  },
-  order: { type: Number, default: 0, index: true }
+  }
 }, { timestamps: { createdAt: 'createdAt', updatedAt: 'updatedAt' } });
 
 CategorySchema.index({ name: 1 }, { unique: true, collation: { locale: 'tr', strength: 2 } });
@@ -62,8 +61,7 @@ const ProductSchema = new Schema({
     w640: String,
     w1024: String
   },
-  categoryId: { type: Schema.Types.ObjectId, ref: 'Category', required: true },
-  order: { type: Number, default: 0, index: true }
+  categoryId: { type: Schema.Types.ObjectId, ref: 'Category', required: true }
 }, { timestamps: { createdAt: 'createdAt', updatedAt: 'updatedAt' } });
 
 ProductSchema.index({ categoryId: 1, name: 1 }); // idx_products_category_name
@@ -73,13 +71,10 @@ ProductSchema.index({ name: 'text', description: 'text' }, { default_language: '
 const EventSchema = new Schema({
   name: { type: String, required: true, trim: true },
   description: { type: String, default: '' },
-  images: {
-    w640: String,
-    w1024: String
-  },
-  eventDate: { type: Date },
-  order: { type: Number, default: 0, index: true }
+  eventDate: { type: Date, required: true }, // <<< YENİ
+  images: { w640: String, w1024: String }
 }, { timestamps: { createdAt: 'createdAt', updatedAt: 'updatedAt' } });
+EventSchema.index({ eventDate: 1 });   
 
 const Category = mongoose.model('Category', CategorySchema, 'categories');
 const Product  = mongoose.model('Product',  ProductSchema,  'products');
@@ -217,7 +212,7 @@ async function processAndUpload(fileBuffer, basePath, baseNameNoExt, vTag) {
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 app.get('/api/categories', async (req, res) => {
-  const categories = await Category.find().sort({ order: 1, createdAt: 1 }).lean();
+  const categories = await Category.find().sort({ createdAt: 1 }).lean();
   res.json(categories);
 });
 
@@ -226,7 +221,7 @@ app.get('/api/products', async (req, res) => {
   const filter = {};
   if (categoryId && Types.ObjectId.isValid(categoryId)) filter.categoryId = new Types.ObjectId(categoryId);
   if (q) filter.$text = { $search: String(q) };
-  const items = await Product.find(filter).sort({ order: 1, createdAt: 1 }).limit(Math.min(Number(limit) || 100, 500)).lean();
+  const items = await Product.find(filter).limit(Math.min(Number(limit) || 100, 500)).lean();
   res.json(items);
 });
 
@@ -239,15 +234,35 @@ app.get('/api/products/:id', async (req, res) => {
 });
 
 app.get('/api/events', async (req, res) => {
-  const items = await Event.find().sort({ order: 1, createdAt: 1 }).lean();
+  const items = await Event.find().sort({ createdAt: -1 }).lean();
   res.json(items);
 });
+app.get('/api/events/upcoming', async (req, res) => {
+  try {
+    const { from, limit = 12 } = req.query;
+    const start = from ? new Date(from) : new Date();
+    if (from && isNaN(start.getTime())) {
+      return res.status(400).json({ error: 'bad from' });
+    }
+    const lim = Math.min(parseInt(limit, 10) || 12, 50);
 
-// ---------- Admin LIST endpoints (eksikti) ----------
+    const items = await Event.find({ eventDate: { $gte: start } })
+      .sort({ eventDate: 1 }) // en yakın tarih önce
+      .limit(lim)
+      .lean();
+
+    res.json(items);
+  } catch (err) {
+    console.error('upcoming error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Admin LIST endpoints ----------
 app.get('/api/admin/categories', requireAuth, async (req, res) => {
   const { q } = req.query;
   const filter = q ? { name: { $regex: String(q), $options: 'i' } } : {};
-  const items = await Category.find(filter).sort({ order: 1, createdAt: 1 }).lean();
+  const items = await Category.find(filter).sort({ createdAt: -1 }).lean();
   res.json(items);
 });
 
@@ -256,24 +271,29 @@ app.get('/api/admin/products', requireAuth, async (req, res) => {
   const filter = {};
   if (q) filter.$text = { $search: String(q) };
   if (categoryId && Types.ObjectId.isValid(categoryId)) filter.categoryId = new Types.ObjectId(categoryId);
-  const items = await Product.find(filter).sort({ order: 1, createdAt: 1 }).lean();
+  const items = await Product.find(filter).sort({ createdAt: -1 }).lean();
   res.json(items);
 });
 
-app.get('/api/admin/events', requireAuth, async (req, res) => {
-  const { q } = req.query;
-  const filter = q ? { name: { $regex: String(q), $options: 'i' } } : {};
-  const items = await Event.find(filter).sort({ order: 1, createdAt: 1 }).lean();
+app.get('/api/admin/events', requireAuth, async (req,res)=>{
+  // opsiyonel tarih filtresi: ?from=ISO&to=ISO
+  const { q, from, to } = req.query;
+  const filter = {};
+  if (q) filter.name = { $regex: String(q), $options: 'i' };
+  if (from || to) {
+    filter.eventDate = {};
+    if (from) filter.eventDate.$gte = new Date(from);
+    if (to)   filter.eventDate.$lte = new Date(to);
+  }
+  const items = await Event.find(filter).sort({ eventDate: -1 }).lean(); // yeni>eski
   res.json(items);
 });
 
 // ---------- Admin: Categories CRUD ----------
 app.post('/api/admin/categories', requireAuth, async (req, res) => {
   try {
-    const last = await Category.findOne().sort({ order: -1 }).select('order').lean();
-    const nextOrder = last && typeof last.order === 'number' ? last.order + 1 : 1;
-const { name, kind } = req.body;
-    const doc = await Category.create({ order: nextOrder,  name, kind });
+    const { name, kind } = req.body;
+    const doc = await Category.create({ name, kind });
     res.status(201).json(doc);
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
@@ -283,7 +303,6 @@ app.put('/api/admin/categories/:id', requireAuth, async (req, res) => {
     const { id } = req.params;
     const { name, kind, images } = req.body;
     const update = {};
-    if (req.body.order != null) update.order = req.body.order;
     if (name != null) update.name = name;
     if (kind != null) update.kind = kind;
     if (images && typeof images === 'object') update.images = images;
@@ -309,9 +328,7 @@ app.delete('/api/admin/categories/:id', requireAuth, async (req, res) => {
 // ---------- Admin: Products CRUD ----------
 app.post('/api/admin/products', requireAuth, async (req, res) => {
   try {
-    const last = await Product.findOne().sort({ order: -1 }).select('order').lean();
-    const nextOrder = last && typeof last.order === 'number' ? last.order + 1 : 1;
-const { name, description, price, categoryId } = req.body;
+    const { name, description, price, categoryId } = req.body;
     if (!Types.ObjectId.isValid(categoryId)) return res.status(400).json({ error: 'bad categoryId' });
     const doc = await Product.create({
       name,
@@ -328,7 +345,6 @@ app.put('/api/admin/products/:id', requireAuth, async (req, res) => {
     const { id } = req.params;
     const { name, description, price, categoryId, images } = req.body;
     const update = {};
-    if (req.body.order != null) update.order = req.body.order;
     if (name != null) update.name = name;
     if (description != null) update.description = description;
     if (price != null) update.price = toDecimal128(price);
@@ -352,41 +368,43 @@ app.delete('/api/admin/products/:id', requireAuth, async (req, res) => {
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-// ---------- Admin: Events CRUD ----------
-app.post('/api/admin/events', requireAuth, async (req, res) => {
-  try {
-    const last = await Event.findOne().sort({ order: -1 }).select('order').lean();
-    const nextOrder = last && typeof last.order === 'number' ? last.order + 1 : 1;
-const { name, description, eventDate }} = req.body;
-    const doc = await Event.create({ order: nextOrder,  name, description: description || '' });
+// ---- EVENTS CRUD ----
+app.post('/api/admin/events', requireAuth, async (req,res)=>{
+  try{
+    const { name, description, eventDate } = req.body;
+    const dt = new Date(eventDate);
+    if (!name || !eventDate || isNaN(dt.getTime())) return res.status(400).json({ error:'name/eventDate required' });
+    const doc = await Event.create({ name, description: description||'', eventDate: dt });
     res.status(201).json(doc);
-  } catch (err) { res.status(400).json({ error: err.message }); }
+  }catch(err){ res.status(400).json({ error: err.message }); }
 });
-
-app.put('/api/admin/events/:id', requireAuth, async (req, res) => {
-  try {
+app.put('/api/admin/events/:id', requireAuth, async (req,res)=>{
+  try{
     const { id } = req.params;
-    const { name, description, images } = req.body;
+    const { name, description, images, eventDate } = req.body;
     const update = {};
-    if (req.body.order != null) update.order = req.body.order;
     if (name != null) update.name = name;
     if (description != null) update.description = description;
-    if (req.body.eventDate != null) update.eventDate = req.body.eventDate;
     if (images && typeof images === 'object') update.images = images;
-    const doc = await Event.findByIdAndUpdate(id, update, { new: true });
-    if (!doc) return res.status(404).json({ error: 'not found' });
+    if (eventDate != null) {
+      const dt = new Date(eventDate);
+      if (isNaN(dt.getTime())) return res.status(400).json({ error:'bad eventDate' });
+      update.eventDate = dt;
+    }
+    const doc = await Event.findByIdAndUpdate(id, update, { new:true });
+    if (!doc) return res.status(404).json({ error:'not found' });
     res.json(doc);
-  } catch (err) { res.status(400).json({ error: err.message }); }
+  }catch(err){ res.status(400).json({ error: err.message }); }
 });
-
-app.delete('/api/admin/events/:id', requireAuth, async (req, res) => {
-  try {
+app.delete('/api/admin/events/:id', requireAuth, async (req,res)=>{
+  try{
     const { id } = req.params;
     const doc = await Event.findByIdAndDelete(id);
-    if (!doc) return res.status(404).json({ error: 'not found' });
-    res.json({ ok: true });
-  } catch (err) { res.status(400).json({ error: err.message }); }
+    if (!doc) return res.status(404).json({ error:'not found' });
+    res.json({ ok:true });
+  }catch(err){ res.status(400).json({ error: err.message }); }
 });
+
 
 // ---------- Admin: Upload (category/product/event) ----------
 app.post('/api/admin/upload/:type/:id', requireAuth, upload.single('file'), async (req, res) => {
@@ -416,78 +434,6 @@ app.post('/api/admin/upload/:type/:id', requireAuth, upload.single('file'), asyn
 });
 
 // ---------- Start ----------
-
-
-// Reorder categories
-app.post('/api/admin/categories/reorder', requireAuth, async (req, res) => {
-  try {
-    const { ids } = req.body;
-    if (!Array.isArray(ids)) return res.status(400).json({ error: 'ids must be array' });
-    const ops = ids.map((id, idx) => ({ updateOne: { filter: { _id: id }, update: { $set: { order: idx } } } }));
-    if (ops.length === 0) return res.json({ ok: true });
-    await Category.bulkWrite(ops);
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-
-
-// Reorder products
-app.post('/api/admin/products/reorder', requireAuth, async (req, res) => {
-  try {
-    const { ids } = req.body;
-    if (!Array.isArray(ids)) return res.status(400).json({ error: 'ids must be array' });
-    const ops = ids.map((id, idx) => ({ updateOne: { filter: { _id: id }, update: { $set: { order: idx } } } }));
-    if (ops.length === 0) return res.json({ ok: true });
-    await Product.bulkWrite(ops);
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-
-
-// Reorder events
-app.post('/api/admin/events/reorder', requireAuth, async (req, res) => {
-  try {
-    const { ids } = req.body;
-    if (!Array.isArray(ids)) return res.status(400).json({ error: 'ids must be array' });
-    const ops = ids.map((id, idx) => ({ updateOne: { filter: { _id: id }, update: { $set: { order: idx } } } }));
-    if (ops.length === 0) return res.json({ ok: true });
-    await Event.bulkWrite(ops);
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-
-
-// Public: upcoming events by eventDate
-app.get('/api/events/upcoming', async (req, res) => {
-  try {
-    const { from, limit = 12 } = req.query;
-    const q = {};
-    if (from) {
-      const d = new Date(String(from));
-      if (!isNaN(d)) q.eventDate = { $gte: d };
-    } else {
-      q.eventDate = { $gte: new Date() };
-    }
-    const items = await Event.find(q).sort({ eventDate: 1, order: 1 }).limit(Math.min(Number(limit)||12, 100)).lean();
-    res.json(items);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 app.listen(PORT, () => {
   console.log(`API listening on http://localhost:${PORT}`);
 });
